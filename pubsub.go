@@ -15,7 +15,8 @@ type operation int
 const (
 	sub operation = iota
 	subOnce
-	pub
+	pubBlock
+	pubNonBlock
 	unsub
 	unsubAll
 	closeTopic
@@ -24,8 +25,9 @@ const (
 
 // PubSub is a collection of topics.
 type PubSub struct {
-	cmdChan  chan cmd
-	capacity int
+	cmdChan          chan cmd
+	capacity         int
+	default_pub_mode operation
 }
 
 type cmd struct {
@@ -38,7 +40,16 @@ type cmd struct {
 // New creates a new PubSub and starts a goroutine for handling operations.
 // The capacity of the channels created by Sub and SubOnce will be as specified.
 func New(capacity int) *PubSub {
-	ps := &PubSub{make(chan cmd), capacity}
+	ps := &PubSub{make(chan cmd), capacity, pubBlock}
+	go ps.start()
+	return ps
+}
+
+// NewNonBlock creates a new PubSub just like New but with non-blocking send operations
+// This might cause messages to be lost, but guarantees Pub returns even if a subscriber
+// stops collecting messages.
+func NewNonBlocking(capacity int) *PubSub {
+	ps := &PubSub{make(chan cmd), capacity, pubNonBlock}
 	go ps.start()
 	return ps
 }
@@ -69,7 +80,17 @@ func (ps *PubSub) AddSub(ch chan interface{}, topics ...string) {
 // Pub publishes the given message to all subscribers of
 // the specified topics.
 func (ps *PubSub) Pub(msg interface{}, topics ...string) {
-	ps.cmdChan <- cmd{op: pub, topics: topics, msg: msg}
+	ps.cmdChan <- cmd{op: ps.default_pub_mode, topics: topics, msg: msg}
+}
+
+// Pub2 works like Pub, but takes one additonal parameter
+// @var ensure_dilvery If true, garantees message will not be lost. If false, guarantees system keeps running in case of error.
+func (ps *PubSub) Pub2(ensure_dilvery bool, msg interface{}, topics ...string) {
+	if ensure_dilvery {
+		ps.cmdChan <- cmd{op: pubBlock, topics: topics, msg: msg}
+	} else {
+		ps.cmdChan <- cmd{op: pubNonBlock, topics: topics, msg: msg}
+	}
 }
 
 // Unsub unsubscribes the given channel from the specified
@@ -124,8 +145,11 @@ loop:
 			case subOnce:
 				reg.add(topic, cmd.ch, true)
 
-			case pub:
-				reg.send(topic, cmd.msg)
+			case pubBlock:
+				reg.sendBlock(topic, cmd.msg)
+
+			case pubNonBlock:
+				reg.sendNonBlock(topic, cmd.msg)
 
 			case unsub:
 				reg.remove(topic, cmd.ch)
@@ -162,9 +186,23 @@ func (reg *registry) add(topic string, ch chan interface{}, once bool) {
 	reg.revTopics[ch][topic] = true
 }
 
-func (reg *registry) send(topic string, msg interface{}) {
+func (reg *registry) sendBlock(topic string, msg interface{}) {
 	for ch, once := range reg.topics[topic] {
 		ch <- msg
+		if once {
+			for topic := range reg.revTopics[ch] {
+				reg.remove(topic, ch)
+			}
+		}
+	}
+}
+
+func (reg *registry) sendNonBlock(topic string, msg interface{}) {
+	for ch, once := range reg.topics[topic] {
+		select {
+		case ch <- msg:
+		default:
+		}
 		if once {
 			for topic := range reg.revTopics[ch] {
 				reg.remove(topic, ch)
