@@ -202,6 +202,8 @@ func (reg *registry) sendNonBlock(topic string, msg interface{}) {
 		select {
 		case ch <- msg:
 		default:
+			//channel can't receive, remove and close it
+			reg.removeChannel(ch)
 		}
 		if once {
 			for topic := range reg.revTopics[ch] {

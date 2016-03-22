@@ -5,10 +5,11 @@
 package pubsub
 
 import (
-	check "launchpad.net/gocheck"
 	"runtime"
 	"testing"
 	"time"
+
+	check "launchpad.net/gocheck"
 )
 
 var _ = check.Suite(new(Suite))
