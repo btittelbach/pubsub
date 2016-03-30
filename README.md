@@ -2,11 +2,12 @@ Install pubsub with,
 
     go get github.com/btittelbach/pubsub
 
-View the [API Documentation](http://godoc.org/github.com/tuxychandru/pubsub).
+View the [API Documentation](http://godoc.org/github.com/btittelbach/pubsub).
 
 ## License
 
 Copyright (c) 2013, Chandra Sekar S  
+Modifications by Bernhard Tittelbach (c) 2015,2016  
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without

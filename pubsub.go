@@ -25,9 +25,9 @@ const (
 
 // PubSub is a collection of topics.
 type PubSub struct {
-	cmdChan          chan cmd
-	capacity         int
-	default_pub_mode operation
+	cmdChan        chan cmd
+	capacity       int
+	defaultPubMode operation
 }
 
 type cmd struct {
@@ -41,16 +41,16 @@ type cmd struct {
 // The capacity of the channels created by Sub and SubOnce will be as specified.
 // If capacity is >9 we assume you want the NonBlocking variant
 func New(capacity int) *PubSub {
-	default_mode := pubNonBlock
+	defaultMode := pubNonBlock
 	if capacity < 10 {
-		default_mode = pubBlock
+		defaultMode = pubBlock
 	}
-	ps := &PubSub{make(chan cmd), capacity, default_mode}
+	ps := &PubSub{make(chan cmd), capacity, defaultMode}
 	go ps.start()
 	return ps
 }
 
-// NewBlocking creates a new PubSub just like the original New with blocking send operations
+// NewBlocking creates a new PubSub just like the original New but defaults to blocking send operations
 // Thus if a goroutine fogets to defer Unsub the whole PubSub system can get stuck
 func NewBlocking(capacity int) *PubSub {
 	ps := &PubSub{make(chan cmd), capacity, pubBlock}
@@ -58,9 +58,11 @@ func NewBlocking(capacity int) *PubSub {
 	return ps
 }
 
-// NewNonBlock creates a new PubSub just like New but with non-blocking send operations
+// NewNonBlocking creates a new PubSub just like New but defaults to non-blocking send operations
 // This might cause messages to be lost, but guarantees Pub returns even if a subscriber
 // stops collecting messages.
+// The channel that would have blocked is then unsubscribed. This is because in a setup with a sufficiently large channel capacity,
+// the most common reason for a channel to block is, that the subscribed goroutine is dead anyway.
 func NewNonBlocking(capacity int) *PubSub {
 	ps := &PubSub{make(chan cmd), capacity, pubNonBlock}
 	go ps.start()
@@ -90,20 +92,20 @@ func (ps *PubSub) AddSub(ch chan interface{}, topics ...string) {
 	ps.cmdChan <- cmd{op: sub, topics: topics, ch: ch}
 }
 
-// Pub publishes the given message to all subscribers of
-// the specified topics.
+// Pub publishes the given message to all subscribers of the specified topics.
 func (ps *PubSub) Pub(msg interface{}, topics ...string) {
-	ps.cmdChan <- cmd{op: ps.default_pub_mode, topics: topics, msg: msg}
+	ps.cmdChan <- cmd{op: ps.defaultPubMode, topics: topics, msg: msg}
 }
 
-// Pub2 works like Pub, but takes one additonal parameter
-// @var ensure_dilvery If true, garantees message will not be lost. If false, guarantees system keeps running in case of error.
-func (ps *PubSub) Pub2(ensure_dilvery bool, msg interface{}, topics ...string) {
-	if ensure_dilvery {
-		ps.cmdChan <- cmd{op: pubBlock, topics: topics, msg: msg}
-	} else {
-		ps.cmdChan <- cmd{op: pubNonBlock, topics: topics, msg: msg}
-	}
+// PubBlocking publishes the given message with Blocking semantics, regardless of the default selected together with the constructor
+func (ps *PubSub) PubBlocking(msg interface{}, topics ...string) {
+	ps.cmdChan <- cmd{op: pubBlock, topics: topics, msg: msg}
+}
+
+// PubNonBlocking publishes the given message with Non-Blocking semantics, regardless of the default selected together with the constructor
+// If a receivers channel fill to capacity, any additional messages are dropped and the receiver in question is unsubscribed
+func (ps *PubSub) PubNonBlocking(msg interface{}, topics ...string) {
+	ps.cmdChan <- cmd{op: pubNonBlock, topics: topics, msg: msg}
 }
 
 // Unsub unsubscribes the given channel from the specified
@@ -119,7 +121,7 @@ func (ps *PubSub) Unsub(ch chan interface{}, topics ...string) {
 }
 
 // Close closes all channels currently subscribed to the specified topics.
-// If a channel is subscribed to multiple topics, some of which is
+// If a channel is subscribed to multiple topics, some of which are
 // not specified, it is not closed.
 func (ps *PubSub) Close(topics ...string) {
 	ps.cmdChan <- cmd{op: closeTopic, topics: topics}
