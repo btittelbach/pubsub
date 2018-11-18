@@ -39,12 +39,9 @@ type cmd struct {
 
 // New creates a new PubSub and starts a goroutine for handling operations.
 // The capacity of the channels created by Sub and SubOnce will be as specified.
-// If capacity is >9 we assume you want the NonBlocking variant
+// The default ist he Blocking variant, since this is the original behaviour
 func New(capacity int) *PubSub {
-	defaultMode := pubNonBlock
-	if capacity < 10 {
-		defaultMode = pubBlock
-	}
+	defaultMode := pubBlock
 	ps := &PubSub{make(chan cmd), capacity, defaultMode}
 	go ps.start()
 	return ps
