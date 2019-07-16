@@ -148,9 +148,12 @@ func (s *Suite) TestUnsubAfterClose(c *check.C) {
 
 func (s *Suite) TestShutdown(c *check.C) {
 	start := runtime.NumGoroutine()
-	New(10).Shutdown()
+	ps := New(10)
 	time.Sleep(1)
 	c.Check(runtime.NumGoroutine()-start, check.Equals, 1)
+	ps.Shutdown()
+	time.Sleep(1)
+	c.Check(runtime.NumGoroutine()-start, check.Equals, 0)
 }
 
 func (s *Suite) TestMultiSub(c *check.C) {
