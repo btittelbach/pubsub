@@ -60,6 +60,7 @@ func (ps *PubSub) Sub(topics ...string) chan interface{} {
 
 // SubOnce is similar to Sub, but only the first message published, after subscription,
 // on any of the specified topics can be received.
+// Note that if you DO NOT CLEAR the channel in time, ALL PUBSUBs will be blocked
 func (ps *PubSub) SubOnce(topics ...string) chan interface{} {
 	return ps.sub(subOnce, topics...)
 }
