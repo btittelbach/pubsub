@@ -10,11 +10,17 @@
 // all of them receive messages published on the topic.
 package pubsub
 
+import "errors"
+
 type operation int
+
+type PubSubGoKickHandler func()
 
 const (
 	sub operation = iota
 	subOnce
+	subButKick
+	addHandler
 	pubBlock
 	pubNonBlock
 	unsub
@@ -25,43 +31,23 @@ const (
 
 // PubSub is a collection of topics.
 type PubSub struct {
-	cmdChan        chan cmd
-	capacity       int
-	defaultPubMode operation
+	cmdChan  chan cmd
+	capacity int
 }
 
 type cmd struct {
-	op     operation
-	topics []string
-	ch     chan interface{}
-	msg    interface{}
+	op           operation
+	topics       []string
+	ch           chan interface{}
+	msg          interface{}
+	errorhandler PubSubGoKickHandler
 }
 
 // New creates a new PubSub and starts a goroutine for handling operations.
 // The capacity of the channels created by Sub and SubOnce will be as specified.
 // The default ist he Blocking variant, since this is the original behaviour
 func New(capacity int) *PubSub {
-	defaultMode := pubBlock
-	ps := &PubSub{make(chan cmd), capacity, defaultMode}
-	go ps.start()
-	return ps
-}
-
-// NewBlocking creates a new PubSub just like the original New but defaults to blocking send operations
-// Thus if a goroutine fogets to defer Unsub the whole PubSub system can get stuck
-func NewBlocking(capacity int) *PubSub {
-	ps := &PubSub{make(chan cmd), capacity, pubBlock}
-	go ps.start()
-	return ps
-}
-
-// NewNonBlocking creates a new PubSub just like New but defaults to non-blocking send operations
-// This might cause messages to be lost, but guarantees Pub returns even if a subscriber
-// stops collecting messages.
-// The channel that would have blocked is then unsubscribed. This is because in a setup with a sufficiently large channel capacity,
-// the most common reason for a channel to block is, that the subscribed goroutine is dead anyway.
-func NewNonBlocking(capacity int) *PubSub {
-	ps := &PubSub{make(chan cmd), capacity, pubNonBlock}
+	ps := &PubSub{make(chan cmd), capacity}
 	go ps.start()
 	return ps
 }
@@ -78,10 +64,23 @@ func (ps *PubSub) SubOnce(topics ...string) chan interface{} {
 	return ps.sub(subOnce, topics...)
 }
 
+// Like Sub, but if you don't empty the channel queue fast enough and eventually block
+// you will be kicked of the PubSub channel
+// you can detect this by watching for a channel close signal
+// additionally you can register a Handler per Channel (or the same for all channels)
+func (ps *PubSub) SubButCloseChanIfBlock(topics ...string) chan interface{} {
+	return ps.sub(subButKick, topics...)
+}
+
 func (ps *PubSub) sub(op operation, topics ...string) chan interface{} {
 	ch := make(chan interface{}, ps.capacity)
 	ps.cmdChan <- cmd{op: op, topics: topics, ch: ch}
 	return ch
+}
+
+// Register a Handler to be called as goroutine if the given receiving channel should block
+func (ps *PubSub) AddSubBlocksHandler(ch chan interface{}, gkh PubSubGoKickHandler) {
+	ps.cmdChan <- cmd{op: addHandler, ch: ch, errorhandler: gkh}
 }
 
 // AddSub adds subscriptions to an existing channel.
@@ -91,18 +90,19 @@ func (ps *PubSub) AddSub(ch chan interface{}, topics ...string) {
 
 // Pub publishes the given message to all subscribers of the specified topics.
 func (ps *PubSub) Pub(msg interface{}, topics ...string) {
-	ps.cmdChan <- cmd{op: ps.defaultPubMode, topics: topics, msg: msg}
-}
-
-// PubBlocking publishes the given message with Blocking semantics, regardless of the default selected together with the constructor
-func (ps *PubSub) PubBlocking(msg interface{}, topics ...string) {
 	ps.cmdChan <- cmd{op: pubBlock, topics: topics, msg: msg}
 }
 
-// PubNonBlocking publishes the given message with Non-Blocking semantics, regardless of the default selected together with the constructor
+// PubNonBlocking publishes the given message with Non-Blocking semantics
 // If a receivers channel fill to capacity, any additional messages are dropped and the receiver in question is unsubscribed
-func (ps *PubSub) PubNonBlocking(msg interface{}, topics ...string) {
-	ps.cmdChan <- cmd{op: pubNonBlock, topics: topics, msg: msg}
+// returns an error on congestion
+func (ps *PubSub) PubNonBlocking(msg interface{}, topics ...string) error {
+	select {
+	case ps.cmdChan <- cmd{op: pubNonBlock, topics: topics, msg: msg}:
+	default:
+		return errors.New("PubSub Congestion: message lost")
+	}
+	return nil
 }
 
 // Unsub unsubscribes the given channel from the specified
@@ -131,8 +131,9 @@ func (ps *PubSub) Shutdown() {
 
 func (ps *PubSub) start() {
 	reg := registry{
-		topics:    make(map[string]map[chan interface{}]bool),
-		revTopics: make(map[chan interface{}]map[string]bool),
+		topics:        make(map[string]map[chan interface{}]bool),
+		revTopics:     make(map[chan interface{}]map[string]bool),
+		blockHandlers: make(map[chan interface{}]PubSubGoKickHandler),
 	}
 
 loop:
@@ -152,22 +153,25 @@ loop:
 		for _, topic := range cmd.topics {
 			switch cmd.op {
 			case sub:
-				reg.add(topic, cmd.ch, false)
+				reg.add(topic, cmd.ch, false, false)
+
+			case subButKick:
+				reg.add(topic, cmd.ch, false, true)
 
 			case subOnce:
-				reg.add(topic, cmd.ch, true)
+				reg.add(topic, cmd.ch, true, false)
 
-			case pubBlock:
-				reg.sendBlock(topic, cmd.msg)
-
-			case pubNonBlock:
-				reg.sendNonBlock(topic, cmd.msg)
+			case pubBlock, pubNonBlock:
+				reg.send(topic, cmd.msg)
 
 			case unsub:
 				reg.remove(topic, cmd.ch)
 
 			case closeTopic:
 				reg.removeTopic(topic)
+
+			case addHandler:
+				reg.addHandler(cmd.errorhandler, cmd.ch)
 			}
 		}
 	}
@@ -182,11 +186,19 @@ loop:
 // registry maintains the current subscription state. It's not
 // safe to access a registry from multiple goroutines simultaneously.
 type registry struct {
-	topics    map[string]map[chan interface{}]bool
-	revTopics map[chan interface{}]map[string]bool
+	topics        map[string]map[chan interface{}]bool
+	revTopics     map[chan interface{}]map[string]bool
+	blockHandlers map[chan interface{}]PubSubGoKickHandler
 }
 
-func (reg *registry) add(topic string, ch chan interface{}, once bool) {
+func (reg *registry) addHandler(errorhandler PubSubGoKickHandler, ch chan interface{}) {
+	if errorhandler == nil {
+		return
+	}
+	reg.blockHandlers[ch] = errorhandler
+}
+
+func (reg *registry) add(topic string, ch chan interface{}, once bool, oktokick bool) {
 	if reg.topics[topic] == nil {
 		reg.topics[topic] = make(map[chan interface{}]bool)
 	}
@@ -195,31 +207,26 @@ func (reg *registry) add(topic string, ch chan interface{}, once bool) {
 	if reg.revTopics[ch] == nil {
 		reg.revTopics[ch] = make(map[string]bool)
 	}
-	reg.revTopics[ch][topic] = true
+	reg.revTopics[ch][topic] = oktokick
 }
 
-func (reg *registry) sendBlock(topic string, msg interface{}) {
-	for ch, once := range reg.topics[topic] {
-		ch <- msg
-		if once {
-			for topic := range reg.revTopics[ch] {
-				reg.remove(topic, ch)
-			}
-		}
-	}
-}
-
-func (reg *registry) sendNonBlock(topic string, msg interface{}) {
+func (reg *registry) send(topic string, msg interface{}) {
 	for ch, once := range reg.topics[topic] {
 		select {
-		case ch <- msg:
+		case ch <- msg: //all good
+			if once {
+				reg.removeChannel(ch)
+			}
 		default:
-			//channel can't receive, remove and close it
-			reg.removeChannel(ch)
-		}
-		if once {
-			for topic := range reg.revTopics[ch] {
-				reg.remove(topic, ch)
+			oktokick := reg.revTopics[ch][topic]
+			if !oktokick {
+				ch <- msg //probably die in a fire, but user want's this. e.g. you might want to test your code with capacity==0
+			}
+			if handler, handler_is_set := reg.blockHandlers[ch]; handler_is_set {
+				go handler()
+			}
+			if oktokick || once {
+				reg.removeChannel(ch)
 			}
 		}
 	}
@@ -232,7 +239,7 @@ func (reg *registry) removeTopic(topic string) {
 }
 
 func (reg *registry) removeChannel(ch chan interface{}) {
-	for topic := range reg.revTopics[ch] {
+	for topic, _ := range reg.revTopics[ch] {
 		reg.remove(topic, ch)
 	}
 }
@@ -248,6 +255,7 @@ func (reg *registry) remove(topic string, ch chan interface{}) {
 
 	delete(reg.topics[topic], ch)
 	delete(reg.revTopics[ch], topic)
+	delete(reg.blockHandlers, ch)
 
 	if len(reg.topics[topic]) == 0 {
 		delete(reg.topics, topic)
